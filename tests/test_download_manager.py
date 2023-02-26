@@ -14,24 +14,17 @@ CONTENT = '"text": ["foo", "foo"]'
 HASH = "6d8ce9aa78a471c7477201efbeabd3bb01ac2e7d100a6dc024ba1608361f90a8"
 
 
-class MockResponse:
-    status_code = 200
-    headers = {"Content-Length": "100"}
-    cookies = {}
-
-    def iter_content(self, **kwargs):
-        return [bytes(CONTENT, "utf-8")]
-
-
-def mock_request(*args, **kwargs):
-    return MockResponse()
+def mock_get(*args, **kwargs):
+    # args are self, rpath, lpath
+    with open(args[-1], "w") as f:
+        f.write(CONTENT)
 
 
 @pytest.mark.parametrize("urls_type", [str, list, dict])
 def test_download_manager_download(urls_type, tmp_path, monkeypatch):
-    import requests
+    import fsspec.implementations.http
 
-    monkeypatch.setattr(requests, "request", mock_request)
+    monkeypatch.setattr(fsspec.implementations.http.HTTPFileSystem, "get", mock_get)
 
     url = URL
     if issubclass(urls_type, str):
