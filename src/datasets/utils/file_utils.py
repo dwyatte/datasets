@@ -9,6 +9,7 @@ import io
 import json
 import os
 import posixpath
+import re
 import shutil
 import sys
 import tempfile
