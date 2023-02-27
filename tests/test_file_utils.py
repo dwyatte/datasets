@@ -10,7 +10,7 @@ from datasets.utils.file_utils import (
     OfflineModeIsEnabled,
     cached_path,
     fsspec_get,
-    fsspec_info,
+    fsspec_head,
     ftp_get,
     ftp_head,
     http_get,
@@ -117,6 +117,6 @@ def test_ftp_offline(tmp_path_factory):
 def test_fsspec_offline(tmp_path_factory):
     filename = tmp_path_factory.mktemp("data") / "file.html"
     with pytest.raises(OfflineModeIsEnabled):
-        fsspec_get("ftp://huggingface.co", temp_file=filename)
+        fsspec_get("s3://huggingface.co", temp_file=filename)
     with pytest.raises(OfflineModeIsEnabled):
-        fsspec_info("ftp://huggingface.co")
+        fsspec_head("s3://huggingface.co")

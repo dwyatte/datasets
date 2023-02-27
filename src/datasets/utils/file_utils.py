@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import List, Optional, Type, TypeVar, Union
 from urllib.parse import urljoin, urlparse
 
-import aiohttp
 import fsspec
 import huggingface_hub
 import requests
@@ -328,74 +327,21 @@ def _request_with_retry(
     return response
 
 
-def fsspec_info(url, proxies=None, headers=None, cookies=None, allow_redirects=True, timeout=10.0, max_retries=0):
+def fsspec_head(url, timeout=10.0):
     _raise_if_offline_mode_is_enabled(f"Tried to reach {url}")
-    scheme = urlparse(url).scheme
-    if scheme.startswith("ftp"):
-        func_kwargs = {}
-        func = fsspec.filesystem("ftp", url).info
-    elif scheme.startswith("http"):
-        proxy = proxies.get(scheme) if proxies else None
-        headers = copy.deepcopy(headers) or {}
-        headers["user-agent"] = get_datasets_user_agent(user_agent=headers.get("user-agent"))
-        func_kwargs = {
-            "proxy": proxy,
-            "cookies": cookies,
-            "allow_redirects": allow_redirects,
-            "headers": headers,
-            "timeout": timeout,
-        }
-        func = fsspec.filesystem("http", client_kwargs={"headers": headers}).info
-    else:
-        func_kwargs = {}
-        func = fsspec.filesystem(scheme).info
-    return _retry(
-        func=func,
-        func_args=(url,),
-        func_kwargs=func_kwargs,
-        exceptions=(fsspec.FSTimeoutError,),
-        max_retries=max_retries,
-    )
+    try:
+        fsspec.filesystem(urlparse(url).scheme).info(url, timeout=timeout)
+    except Exception:
+        return False
+    return True
 
 
-def fsspec_get(
-    url, temp_file, proxies=None, resume_size=0, headers=None, cookies=None, timeout=100.0, max_retries=0, desc=None
-):
+def fsspec_get(url, temp_file, timeout=10.0):
     _raise_if_offline_mode_is_enabled(f"Tried to reach {url}")
-    scheme = urlparse(url).scheme
-    if scheme.startswith("ftp"):
-        func_kwargs = {}
-        func = fsspec.filesystem("ftp", url).get
-    elif scheme.startswith("http"):
-        proxy = proxies.get(scheme) if proxies else None
-        headers = copy.deepcopy(headers) or {}
-        headers["user-agent"] = get_datasets_user_agent(user_agent=headers.get("user-agent"))
-        if resume_size > 0:
-            headers["Range"] = f"bytes={resume_size:d}-"
-        func_kwargs = {
-            "proxy": proxy,
-            "cookies": cookies,
-            "headers": headers,
-            "timeout": timeout,
-            "callbacks": fsspec.callbacks.TqdmCallback(
-                unit="B",
-                unit_scale=True,
-                initial=resume_size,
-                desc=desc or "Downloading",
-                disable=not logging.is_progress_bar_enabled(),
-            ),
-        }
-        func = fsspec.filesystem("http", client_kwargs={"headers": headers}).get
-    else:
-        func_kwargs = {}
-        func = fsspec.filesystem(scheme).get
-    return _retry(
-        func=func,
-        func_args=(url, temp_file.name),
-        func_kwargs=func_kwargs,
-        exceptions=(fsspec.FSTimeoutError,),
-        max_retries=max_retries,
-    )
+    try:
+        fsspec.filesystem(urlparse(url).scheme).get(url, temp_file, timeout=timeout)
+    except fsspec.FSTimeoutError as e:
+        raise ConnectionError(e) from None
 
 
 def ftp_head(url, timeout=10.0):
@@ -471,9 +417,12 @@ def http_head(
 
 
 def request_etag(url: str, use_auth_token: Optional[Union[str, bool]] = None) -> Optional[str]:
+    if urlparse(url).scheme not in ("http", "https"):
+        return None
     headers = get_authentication_headers_for_url(url, use_auth_token=use_auth_token)
-    info = fsspec_info(url, allow_redirects=True, headers=headers, max_retries=3)
-    etag = info.get("ETag")
+    response = http_head(url, headers=headers, max_retries=3)
+    response.raise_for_status()
+    etag = response.headers.get("ETag") if response.ok else None
     return etag
 
 
@@ -519,10 +468,10 @@ def get_from_cache(
         cached_url = url  # additional parameters may be added to the given URL
 
     connected = False
+    response = None
     cookies = None
     etag = None
-    info_error = None
-    info = None
+    head_error = None
 
     # Try a first time to file the file on the local file system without eTag (None)
     # if we don't ask for 'force_download' then we spare a request
@@ -539,8 +488,13 @@ def get_from_cache(
 
     # We don't have the file locally or we need an eTag
     if not local_files_only:
+        scheme = urlparse(url).scheme
+        if scheme == "ftp":
+            connected = ftp_head(url)
+        elif scheme in ("s3", "gs"):
+            connected = fsspec_head(url)
         try:
-            info = fsspec_info(
+            response = http_head(
                 url,
                 allow_redirects=True,
                 proxies=proxies,
@@ -548,14 +502,39 @@ def get_from_cache(
                 max_retries=max_retries,
                 headers=headers,
             )
-            if use_etag:
-                etag = info.get("ETag")
-                if etag is None:
-                    logger.info(f"Couldn't get ETag version for url {url}")
-            connected = True
-        except fsspec.FSTimeoutError as e:
+            if response.status_code == 200:  # ok
+                etag = response.headers.get("ETag") if use_etag else None
+                for k, v in response.cookies.items():
+                    # In some edge cases, we need to get a confirmation token
+                    if k.startswith("download_warning") and "drive.google.com" in url:
+                        url += "&confirm=" + v
+                        cookies = response.cookies
+                connected = True
+                # Fix Google Drive URL to avoid Virus scan warning
+                if "drive.google.com" in url and "confirm=" not in url:
+                    url += "&confirm=t"
+            # In some edge cases, head request returns 400 but the connection is actually ok
+            elif (
+                (response.status_code == 400 and "firebasestorage.googleapis.com" in url)
+                or (response.status_code == 405 and "drive.google.com" in url)
+                or (
+                    response.status_code == 403
+                    and (
+                        re.match(r"^https?://github.com/.*?/.*?/releases/download/.*?/.*?$", url)
+                        or re.match(r"^https://.*?s3.*?amazonaws.com/.*?$", response.url)
+                    )
+                )
+                or (response.status_code == 403 and "ndownloader.figstatic.com" in url)
+            ):
+                connected = True
+                logger.info(f"Couldn't get ETag version for url {url}")
+            elif response.status_code == 401 and config.HF_ENDPOINT in url and use_auth_token is None:
+                raise ConnectionError(
+                    f"Unauthorized for URL {url}. Please use the parameter `use_auth_token=True` after logging in with `huggingface-cli login`"
+                )
+        except (OSError, requests.exceptions.Timeout) as e:
             # not connected
-            info_error = e
+            head_error = e
             pass
 
     # connected == False = we don't have a connection, or url doesn't exist, or is otherwise inaccessible.
@@ -568,9 +547,15 @@ def get_from_cache(
                 f"Cannot find the requested files in the cached path at {cache_path} and outgoing traffic has been"
                 " disabled. To enable file online look-ups, set 'local_files_only' to False."
             )
+        elif response is not None and response.status_code == 404:
+            raise FileNotFoundError(f"Couldn't find file at {url}")
         _raise_if_offline_mode_is_enabled(f"Tried to reach {url}")
-        if info_error is not None:
-            raise ConnectionError(f"Couldn't reach {url} ({repr(info_error)})")
+        if head_error is not None:
+            raise ConnectionError(f"Couldn't reach {url} ({repr(head_error)})")
+        elif response is not None:
+            raise ConnectionError(f"Couldn't reach {url} (error {response.status_code})")
+        else:
+            raise ConnectionError(f"Couldn't reach {url}")
 
     # Try a second time
     filename = hash_url_to_filename(cached_url, etag)
@@ -605,9 +590,13 @@ def get_from_cache(
         with temp_file_manager() as temp_file:
             logger.info(f"{url} not found in cache or force_download set to True, downloading to {temp_file.name}")
 
-            try:
-                # GET file object
-                fsspec_get(
+            # GET file object
+            if scheme == "ftp":
+                ftp_get(url, temp_file)
+            elif scheme in ("gs", "s3"):
+                fsspec_get(url, temp_file)
+            else:
+                http_get(
                     url,
                     temp_file,
                     proxies=proxies,
@@ -617,11 +606,6 @@ def get_from_cache(
                     max_retries=max_retries,
                     desc=download_desc,
                 )
-            except aiohttp.client_exceptions.ClientResponseError as e:
-                if e.status == 401 and config.HF_ENDPOINT in url and use_auth_token is None:
-                    raise ConnectionError(
-                        f"Unauthorized for URL {url}. Please use the parameter `use_auth_token=True` after logging in with `huggingface-cli login`"
-                    )
 
         logger.info(f"storing {url} in cache at {cache_path}")
         shutil.move(temp_file.name, cache_path)
